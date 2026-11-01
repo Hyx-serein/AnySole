@@ -675,6 +675,9 @@ def _evaluate_one(
     v_hmr_mode = str(checkpoint.get("config", {}).get("v_input", "hrnet")) == "hmr_gvhmr"
     continuation = bool(config.get("continuation", False))
     warm_start = bool(config.get("warm_start", False))
+    # 续写协议 §4（V7_续写协议方案）：ckpt 带 v7_prev_ctx → 评估用
+    # stride=tw//2 重叠窗 + 逐窗链式 ctx（导出/协议两路）。
+    v7_ctx = bool(checkpoint.get("config", {}).get("v7_prev_ctx", False))
 
     # --split selects the evaluated session set even without --limit-sessions.
     # (AnySoleDataset mode="eval" otherwise defaults to the val column, which
@@ -701,7 +704,7 @@ def _evaluate_one(
         cam_id=int(config.get("cam_id", 3)),
         # E6.4: continuation eval uses overlapping windows (stride = tw/2);
         # without it the stride stays non-overlapping (E3 behavior).
-        stride=(tw // 2) if (pos_mode and continuation) else None,
+        stride=(tw // 2) if ((pos_mode and continuation) or v7_ctx) else None,
                         t_phys_v2=bool(checkpoint.get("config", {}).get("t_phys_v2", False)),
                         d8_heads=bool(checkpoint.get("config", {}).get("d8_heads", False)),
     )
@@ -729,7 +732,62 @@ def _evaluate_one(
     for config_value in config_values:
         exports = {}
         with torch.inference_mode():
-            if pos_mode:
+            if v7_ctx and motion_out is not None:
+                # 续写协议 §4：逐会话逐窗链式生成（ctx = 上一窗预测在 half
+                # 处的根状态），全窗写入 exports → _pack_motion_export
+                # 同时间淡化组装（eval.py 顶部修复版）。val 不写 motion
+                # （motion_out=None）时跳过（指标走 run_protocol）。
+                half = tw // 2
+                hard_prefix = bool(checkpoint.get("config", {}).get("v7_ctx_hardprefix", False))
+                for session_id, idxs in _session_window_groups(dataset).items():
+                    ctx = None
+                    prev_start = None
+                    prev_pose = None  # G3 硬前缀（与 run_protocol 同款拼接）
+                    prev_v = None
+                    for i in idxs:
+                        raw = dataset[i]
+                        batch = move_batch(collate_windows([raw]), device)
+                        batch_size = 1
+                        config_id = torch.full((batch_size,), config_value,
+                                               device=device, dtype=torch.long)
+                        batch["config_id"] = config_id
+                        assert_batch_shapes(batch, batch_size, tw=tw,
+                            t_phys_v2=bool(checkpoint.get("config", {}).get("t_phys_v2", False)))
+                        v_feat, t_raw, t_phys, t_s2m = condition_inputs(batch, config_id)
+                        v_kw = {"V_hmr": batch.get("V_hmr")} if v_hmr_mode else {}
+                        start = int(raw["frame_start"])
+                        if ctx is None or prev_start is None or start != prev_start + half:
+                            ctx = torch.zeros(1, 10, device=device)
+                        out = model(v_feat, t_raw, t_phys, config_id, [session_id],
+                                    T_s2m=t_s2m, **v_kw, prev_ctx=ctx)
+                        anchor = batch["trans_anchor"][:, None, :]
+                        reset = (prev_start is None or start != prev_start + half)
+                        if hard_prefix and prev_pose is not None:
+                            pose_w = out["x0_hat"][0].clone()
+                            v_w = out["v_hat"][0].clone()
+                            pose_w[:half] = prev_pose[half:]
+                            v_w[:half] = prev_v[half:]
+                            trans_w = torch.cumsum(v_w, dim=0) / float(FPS) + anchor[0]
+                        else:
+                            pose_w = out["x0_hat"][0]
+                            v_w = out["v_hat"][0]
+                            trans_w = (out["trans_hat"] + anchor)[0]
+                        exports.setdefault(session_id, []).append(
+                            (
+                                start,
+                                pose_w.cpu().numpy(),
+                                trans_w.cpu().numpy(),
+                                (batch["trans_gt"] + anchor)[0].cpu().numpy(),
+                            )
+                        )
+                        root6 = pose_w[half, :6].detach()
+                        vel3 = v_w[half, :3].detach()
+                        ctx = torch.cat([root6, vel3, torch.ones(1, device=device)],
+                                        dim=0).unsqueeze(0)
+                        prev_start = start
+                        prev_pose = pose_w
+                        prev_v = v_w
+            elif pos_mode:
                 # E6.1 position mode: sample positions, convert to world 6D
                 # per window (R_init composition), then reuse all 6D metrics.
                 if continuation:

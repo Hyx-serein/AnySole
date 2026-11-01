@@ -213,7 +213,8 @@ def condition_inputs(batch: dict, config_id: torch.Tensor, t_s2m_dim: int = T_S2
     return v_feat, t_raw, t_phys, t_s2m
 
 
-def backward_v7_enum(model, batch, config):
+def backward_v7_enum(model, batch, config, ctx_ss_p: float = 0.0,
+                     ctx_cache=None):
     """Enumerate the same windows, accumulate gradients, then update once.
 
     Motion keeps config_probs weights. T-only auxiliary terms normalize over
@@ -237,7 +238,24 @@ def backward_v7_enum(model, batch, config):
             continue
         cid = torch.full((batch_size,), mode, dtype=torch.long, device=batch["pose_gt"].device)
         v_feat, t_raw, t_phys, t_s2m = condition_inputs(batch, cid)
-        out = model(v_feat, t_raw, t_phys, cid, batch.get("session_id"), T_s2m=t_s2m)
+        ctx = batch.get("ctx")
+        if ctx is not None and ctx_cache is not None and ctx_ss_p > 0:
+            # G1 scheduled sampling（续写 v2 实验矩阵）：以概率 p 用上一步
+            # 缓存的「模型预测 ctx」替换 GT ctx——打破 teacher forcing 的
+            # oracle 契约（零额外前向；缓存分布 = 模型生成分布）。
+            if ctx_cache[0] is not None and torch.rand(1).item() < ctx_ss_p:
+                c = ctx_cache[0].to(ctx.dtype)
+                n = min(c.shape[0], ctx.shape[0])
+                ctx = ctx.clone()
+                ctx[:n] = c[:n]
+        out = model(v_feat, t_raw, t_phys, cid, batch.get("session_id"), T_s2m=t_s2m,
+                    prev_ctx=ctx)
+        if ctx_cache is not None:
+            bsz = out["x0_hat"].shape[0]
+            ctx_cache[0] = torch.cat([
+                out["x0_hat"][:, 10, :6].detach(),
+                out["v_hat"][:, 10, :3].detach(),
+                torch.ones(bsz, 1, device=out["x0_hat"].device)], dim=1)
         losses = compute_losses(out, batch, cid, mode_config)
         if not bool(torch.isfinite(losses["loss"]) & torch.isfinite(out["F"]).all()):
             # The caller discards all accumulated gradients on failure.
@@ -643,6 +661,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="E6.7: override yaml loss weight lambda_con.")
     parser.add_argument("--lambda-contact", type=float, default=None, metavar="W",
                         help="V3_Ev1: override yaml loss weight lambda_contact (T contact head BCE).")
+    parser.add_argument("--ctx-ss", type=float, default=0.0,
+                        help="V7 续写 G1: scheduled sampling 目标概率 p"
+                        "（线性升至 p 用模型预测 ctx 替换 GT ctx；0=关）。")
     parser.add_argument("--lambda-nll", type=float, default=None, metavar="W",
                         help="V3_Ev1: override yaml loss weight lambda_nll (V pose sigma NLL).")
     parser.add_argument("--lambda-prior-pose", type=float, default=None, metavar="W",
@@ -707,6 +728,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="E6.7: override yaml loss weight lambda_pose_vel (E6.2, pos mode).")
     parser.add_argument("--lambda-bone", type=float, default=None, metavar="W",
                         help="E6.7: override yaml loss weight lambda_bone (E6.2, pos mode).")
+    parser.add_argument("--lambda-s", type=float, default=None, metavar="W",
+                        help="S 显式收益监督：四组门 (vel/other/left/right) 对离线相对"
+                             "收益标签 BCE 权重（0 = 关）。")
+    parser.add_argument("--v7-s-label", type=Path, default=None,
+                        help="S 显式收益监督：s_gate_diag.py 产出目录（含 "
+                             "tlr_gate_diag.npz/.json）。")
     parser.add_argument("--device", default="auto", help="Device such as cuda, cuda:0, or cpu.")
     parser.add_argument("--modal", choices=MODEL_NAMES, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -929,7 +956,8 @@ def _evaluate(model, diffusion, loader, config, device):
                 if regress_mode:
                     # F0b: single forward, no DDIM sampling.
                     z_kw = {"z_src": v5_1_z_src(config_value)} if v5_1_mode else {}
-                    out = model(v_feat, t_raw, t_phys, cid, batch.get("session_id"), T_s2m=t_s2m, **v_kw, **z_kw)
+                    out = model(v_feat, t_raw, t_phys, cid, batch.get("session_id"), T_s2m=t_s2m, **v_kw, **z_kw,
+                    prev_ctx=batch.get("ctx"))
                     pred_pose = out["x0_hat"]
                 else:
                     warm_prior = None
@@ -1425,7 +1453,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "lambda_prior_nll", "lambda_prior_traj", "lambda_air",
                 "lambda_foot_res", "lambda_phase", "lambda_cop",
                 "lambda_tcop", "lambda_strike", "lambda_gtcop",
-                "lambda_cond"):
+                "lambda_cond", "lambda_s"):
         value = getattr(args, key)
         if value is not None:
             config[key] = float(value)
@@ -1445,6 +1473,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         config["d8_heads"] = bool(args.d8_heads)
     if args.occ_a3_monitor:
         config["occ_a3_monitor"] = True
+    if args.v7_s_label is not None:
+        config["v7_s_label"] = str(args.v7_s_label)
     for key, value in (("p_occ", args.p_occ), ("p_nullV", args.p_nullv),
                        ("p_nullT", args.p_nullt)):
         if value is not None:
@@ -1494,12 +1524,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             f2_repr=bool(config.get("f2_repr", False)),
             smpl_roots=config.get("smpl_roots"),
             cam_id=int(config.get("cam_id", 3)),
+            v7_ctx=bool(config.get("v7_prev_ctx", False)),
             load_v5_1_gt=v5_1_mode,
             occ_mix=occ_mix_kwargs,
             t_phys_v2=bool(config.get("t_phys_v2", False)),
             d8_heads=bool(config.get("d8_heads", False)),
             tactile_aug=tactile_aug_kwargs,
             smpl_support_policy=str(config.get("smpl_support_policy", "exclude")),
+            v7_s_label=config.get("v7_s_label"),
         )
     except FileNotFoundError as exc:
         if "HRNet cache" in str(exc):
@@ -1523,7 +1555,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     val_loader = None
     try:
-        val_dataset = AnySoleDataset(mode="eval", seq_root=Path(config["seq_root"]), split_csv=Path(config["split_csv"]), cache_root=Path(config["cache_root"]), window_length=int(config["tw"]), contact_method=str(config["contact_method"]), tactile_input=str(config.get("tactile_input", "raw108")), no_imu=bool(config.get("no_imu", False)), v_input=str(config.get("v_input", "hrnet")), f2_repr=bool(config.get("f2_repr", False)), smpl_roots=config.get("smpl_roots"), cam_id=int(config.get("cam_id", 3)), load_v5_1_gt=v5_1_mode, occ_mix=occ_mix_kwargs, t_phys_v2=bool(config.get("t_phys_v2", False)), d8_heads=bool(config.get("d8_heads", False)), smpl_support_policy=str(config.get("smpl_support_policy", "exclude")))
+        val_dataset = AnySoleDataset(mode="eval", seq_root=Path(config["seq_root"]), split_csv=Path(config["split_csv"]), cache_root=Path(config["cache_root"]), window_length=int(config["tw"]), contact_method=str(config["contact_method"]), tactile_input=str(config.get("tactile_input", "raw108")), no_imu=bool(config.get("no_imu", False)), v_input=str(config.get("v_input", "hrnet")), f2_repr=bool(config.get("f2_repr", False)), smpl_roots=config.get("smpl_roots"), cam_id=int(config.get("cam_id", 3)), load_v5_1_gt=v5_1_mode, occ_mix=occ_mix_kwargs, t_phys_v2=bool(config.get("t_phys_v2", False)), d8_heads=bool(config.get("d8_heads", False)),
+        v7_ctx=bool(config.get("v7_prev_ctx", False)), smpl_support_policy=str(config.get("smpl_support_policy", "exclude")))
         if len(val_dataset):
             val_loader = DataLoader(val_dataset, batch_size=int(config["batch_size"]), shuffle=False, num_workers=int(config["num_workers"]), collate_fn=collate_windows, pin_memory=device.type == "cuda")
     except (FileNotFoundError, RuntimeError) as exc:
@@ -1780,6 +1813,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # a fixed grouping.  Non-cluster runs keep the defaults (temp 1.0, no
     # lock) so V3-3 behavior is byte-identical.
     cluster_mode = bool(config.get("assign_cluster", False))
+    ctx_ss_cache = None  # G1 scheduled sampling 的模型预测 ctx 缓存（enum 分支也引用，须无条件初始化）
     if cluster_mode:
         total_steps = int(config["epochs"]) * len(loader)
         anneal_steps = int(float(config.get("assign_anneal_frac", 0.7)) * total_steps)
@@ -1880,7 +1914,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             if sigma_freeze_steps:
                 model.pose_head.set_sigma_frozen(global_step < sigma_freeze_steps)
             if enum_mode:
-                out, losses = backward_v7_enum(model, batch, config)
+                if ctx_ss_cache is None:
+                    ctx_ss_cache = [None]
+                ctx_ss_target = float(config.get("ctx_ss", 0.0))
+                p_cur = (ctx_ss_target * min(1.0, global_step / max(1, total_steps))
+                         if ctx_ss_target > 0 else 0.0)
+                out, losses = backward_v7_enum(model, batch, config,
+                                               ctx_ss_p=p_cur,
+                                               ctx_cache=ctx_ss_cache)
             elif v3f_mode:
                 # V3_Fv1: diffuse the full normalized state [pose | trans |
                 # contact]; 10% V zeroing is the unconditional prior pass

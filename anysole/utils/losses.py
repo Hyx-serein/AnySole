@@ -13,6 +13,7 @@ from anysole.utils.v5_conditioning import availability_masks, conditioning_polic
 from anysole.types import (
     CONFIG_T,
     CONFIG_V,
+    CONFIG_VT,
     FPS,
     JOINT_PARENTS,
     KNEE_ANKLE_FOOT_JOINTS,
@@ -899,12 +900,30 @@ def compute_losses_v7(out, batch, config_id, weights) -> dict:
             # 无监督塌缩到 0/1 两端）。
             l_route = (gate - 0.5).square().mean()
 
+    # S 显式收益监督（V7_C门控修改方案 §7，2026-11-01）：四组门
+    # （vel/other/left/right）对离线相对收益标签做 BCE。组门从逐查询门
+    # route_gate (B,tw,10,1) 按查询下标 [0,1,6,7] 取（与 s_gate_diag.py
+    # g[...,[0,1,6,7],0] 同口径）。仅 VT 在场 + 标签有效帧监督；标签
+    # y=sigmoid(D/τ) 由 dataset 用固定 τ 预计算，本损失只做 BCE。
+    l_s_gate = l_pose.new_zeros(())
+    if gate is not None and batch.get("gate_label") is not None:
+        lambda_s = _weight(weights, "lambda_s", 0.0)
+        if lambda_s > 0.0 and gate.dim() == 4 and gate.shape[-2] == 10:
+            g4 = gate[..., [0, 1, 6, 7], 0]                 # (B, tw, 4)
+            y = batch["gate_label"].to(gate.device)          # (B, tw, 4)
+            m = batch["gate_valid"].to(gate.device)          # (B, tw) bool
+            vt = (config_id == CONFIG_VT).to(gate.device)    # (B,)
+            mask = (m & vt.view(-1, 1)).unsqueeze(-1)        # (B, tw, 1)
+            bce = F.binary_cross_entropy(g4, y, reduction="none")
+            l_s_gate = (bce * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
+
     total = (
         _weight(weights, "lambda_pose", 3.0) * l_pose
         + _weight(weights, "lambda_traj", 1.0) * l_traj
         + _weight(weights, "lambda_contact", 0.0) * l_contact
         + _weight(weights, "lambda_foot", 0.0) * l_foot
         + _weight(weights, "lambda_route", 0.0) * l_route
+        + _weight(weights, "lambda_s", 0.0) * l_s_gate
     )
     zero = l_pose.new_zeros(())
     return {
@@ -935,6 +954,7 @@ def compute_losses_v7(out, batch, config_id, weights) -> dict:
         "L_cond": zero,
         "L_foot": l_foot,
         "L_route": l_route,
+        "L_s_gate": l_s_gate,
         "loss": total,
     }
 

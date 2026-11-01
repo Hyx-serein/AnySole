@@ -81,6 +81,7 @@ from anysole.utils.metrics import (
     root_orientation_drift_deg,
     root_orientation_error_deg,
     root_trajectory_metrics,
+    root_trajectory_segmented_error,
     shape_vertex_std,
     temporal_metrics,
     windowed_world_mpjpe,
@@ -147,6 +148,7 @@ METRIC_DISPLAY_NAMES = {
     "w_mpjpe100_mm": "W-MPJPE100",
     "wa_mpjpe100_mm": "WA-MPJPE100",
     "root_ate_mm": "traj_ATE",
+    "root_ate_seg20_mm": "traj_ATE@0.5s",
     "root_orientation_deg": "RootOrientation",
     "root_orientation_drift_deg": "RootOrientationDrift",
     "accel_error_m_s2": "AccelError",
@@ -164,7 +166,8 @@ INVERSE_DISPLAY_NAMES = {
 # primary metric is visible at a glance; doubles as the brief whitelist.
 BRIEF_MOTION_KEYS = (
     "pa_mpjpe_mm", "mpjpe_mm", "global_mpjpe_mm", "mpjae_deg", "w_mpjpe100_mm",
-    "root_ate_mm", "root_orientation_drift_deg", "foot_sliding_mm",
+    "root_ate_mm", "root_ate_seg20_mm", "root_orientation_drift_deg",
+    "foot_sliding_mm",
     "ground_pen_mm", "jitter_gt_m_s3", "jitter_pred_m_s3",
 )
 # Keys the detail file reports but that are diagnostics, not formal metrics
@@ -383,6 +386,8 @@ def _session_metrics(seq: dict, tw: int, forward_axis: int, config_value: int,
     root = root_trajectory_metrics(pred_np[:, 0], gt_np[:, 0])
     accum.add_scalar("root_ate_mm", root["root_ate_mm"], T)
     accum.add_scalar("root_rte_percent", root["root_rte_percent"], T)
+    accum.add_scalar("root_ate_seg20_mm",
+                     root_trajectory_segmented_error(pred_np[:, 0], gt_np[:, 0]), T)
     temporal = temporal_metrics(pred_aligned, gt_aligned, times_np)
     for key in ("accel_error_m_s2", "jitter_pred_m_s3", "jitter_gt_m_s3"):
         accum.add_scalar(key, float(temporal[key]), T)
@@ -659,8 +664,24 @@ def _evaluate_config(
     session_rows: List[dict] = []
     groups = _session_window_groups(dataset)
     session_by_id = {s["session_id"]: s for s in dataset.sessions}
+    v7_ctx = bool(getattr(model, "prev_ctx", False))
+    half = tw // 2
     with torch.inference_mode():
         for session_id, idxs in groups.items():
+            if v7_ctx:
+                # 续写协议 §4：逐窗链式生成 + 发射组装（十指标口径不变）。
+                seq, seq_frame_ids = _v7_ctx_session_seq(
+                    dataset, model, session_id, idxs, config_value, device,
+                    half, {"V_hmr": dataset[idxs[0]].get("V_hmr")} if v_hmr_mode else {},
+                    hard_prefix=bool(checkpoint.get("config", {}).get("v7_ctx_hardprefix", False)))
+                if dump_detail:
+                    _merge_sess_detail(
+                        seq, tw, forward_axis, config_value, accum, contact,
+                        session_rows, window_rows, session_id=session_id,
+                        frame_ids=seq_frame_ids, window_starts=None)
+                else:
+                    _session_metrics(seq, tw, forward_axis, config_value, accum, contact)
+                continue
             raw = [dataset[i] for i in idxs]
             batch = move_batch(collate_windows(raw), device)
             bsz = batch["pose_gt"].shape[0]
@@ -868,36 +889,12 @@ def _evaluate_config(
                 # Per-session accumulation, merged into the pooled accum in the
                 # same summation sequence as the direct path, so the pooled
                 # result stays bit-identical with or without the dump.
-                sess_accum = _Accum()
-                sess_contact = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
-                _session_metrics(seq, tw, forward_axis, config_value, sess_accum, sess_contact)
-                for name, value in sess_accum.sums.items():
-                    accum.sums[name] = accum.sums.get(name, 0.0) + value
-                    accum.counts[name] = accum.counts.get(name, 0.0) + sess_accum.counts[name]
-                for key in contact:
-                    contact[key] += sess_contact[key]
-                sess_metrics = sess_accum.means()
-                p_c = sess_contact["tp"] / max(sess_contact["tp"] + sess_contact["fp"], 1)
-                r_c = sess_contact["tp"] / max(sess_contact["tp"] + sess_contact["fn"], 1)
-                sess_metrics["contact_f1"] = 2.0 * p_c * r_c / max(p_c + r_c, 1e-8)
-                sess_metrics["contact_acc"] = (sess_contact["tp"] + sess_contact["tn"]) / max(
-                    sess_contact["tp"] + sess_contact["fp"] + sess_contact["fn"] + sess_contact["tn"], 1)
-                sess_metrics["contact_recall"] = sess_contact["tp"] / max(sess_contact["tp"] + sess_contact["fn"], 1)
-                sess_metrics["air_recall"] = sess_contact["tn"] / max(sess_contact["tn"] + sess_contact["fp"], 1)
-                sess_metrics["contact_balanced_acc"] = 0.5 * (
-                    sess_metrics["contact_recall"] + sess_metrics["air_recall"])
-                session_rows.append({
-                    "frame_ids": [int(sample["frame_start"]) + offset for sample in raw for offset in range(tw)],
-                    "session_id": str(session_id),
-                    "n_frames": int(seq["pred_pose"].shape[0]),
-                    "metrics": sess_metrics,
-                })
-                w_rows = _window_detail_rows(seq, tw, [int(sample["frame_start"]) for sample in raw])
-                window_rows["session_ids"].extend([str(session_id)] * len(w_rows["frame_starts"]))
-                window_rows["frame_starts"].extend(w_rows["frame_starts"])
-                window_rows["n_frames"].extend(w_rows["n_frames"])
-                for key, values in w_rows["metrics"].items():
-                    window_rows["metrics"].setdefault(key, []).extend(values)
+                _merge_sess_detail(
+                    seq, tw, forward_axis, config_value, accum, contact,
+                    session_rows, window_rows, session_id=session_id,
+                    frame_ids=[int(sample["frame_start"]) + offset
+                               for sample in raw for offset in range(tw)],
+                    window_starts=[int(sample["frame_start"]) for sample in raw])
             else:
                 _session_metrics(seq, tw, forward_axis, config_value, accum, contact)
             if (config_value == CONFIG_V and v2t_out_dir is not None
@@ -971,6 +968,123 @@ def _evaluate_config(
     return result, window_rows, session_rows
 
 
+def _v7_ctx_session_seq(dataset, model, session_id, idxs, config_value,
+                        device, half, v_kw, hard_prefix=False):
+    """续写协议 §4：按会话逐窗链式生成（ctx = 上一窗预测在 half 处的根
+    状态 [根 6D + 根速度 3 + 有效 1]；首窗/跳窗 → 零 + flag 0），按发射
+    规则组装（首窗全 20 帧、后续窗只发新 half；窗口间 fake 帧缺口不在
+    评分范围，与现协议 valid_windows 评分帧一致）→ 会话级 seq + frame_ids。
+    """
+    chunks = []
+    frame_ids = []
+    ctx = None
+    prev_start = None
+    meta = None
+    prev_pose = None  # G3 硬前缀：上一窗（拼接后）预测
+    prev_v = None
+    for i in idxs:
+        raw = dataset[i]
+        batch = move_batch(collate_windows([raw]), device)
+        start = int(raw["frame_start"])
+        config_id = torch.full((1,), config_value, device=device, dtype=torch.long)
+        v_feat, t_raw, t_phys, t_s2m = condition_inputs(batch, config_id)
+        reset = (ctx is None or prev_start is None or start != prev_start + half)
+        if reset:
+            ctx = torch.zeros(1, 10, device=device)
+        out = model(v_feat, t_raw, t_phys, config_id, [session_id], T_s2m=t_s2m,
+                    **v_kw, prev_ctx=ctx)
+        anchor = batch["trans_anchor"][:, None, :]
+        emit = 0 if reset else half
+        if hard_prefix and prev_pose is not None:
+            # G3（续写 v2 实验矩阵）：窗 0:half 逐位覆盖为上一窗预测
+            # half: ——接缝按构造消失（Step2Motion inpainting 的回归等价）；
+            # trans 由拼接后的 v_hat 重算（模型内 trans_hat 基于旧 v_hat）。
+            pose_w = out["x0_hat"][0].clone()
+            v_w = out["v_hat"][0].clone()
+            pose_w[:half] = prev_pose[half:]
+            v_w[:half] = prev_v[half:]
+            trans_w = torch.cumsum(v_w, dim=0) / float(FPS) + anchor[0]
+            pred_pose_w, pred_trans_w = pose_w, trans_w
+        else:
+            pred_pose_w = out["x0_hat"][0]
+            pred_trans_w = (out["trans_hat"] + anchor)[0]
+            pose_w = pred_pose_w
+            v_w = out["v_hat"][0]
+        chunks.append({
+            "pred_pose": pred_pose_w[emit:].detach().cpu(),
+            "pred_trans": pred_trans_w[emit:].detach().cpu(),
+            "gt_pose": batch["pose_gt"][0, emit:].cpu(),
+            "gt_trans": (batch["trans_gt"] + anchor)[0, emit:].cpu(),
+            "kp_gt": batch["kp_gt"][0, emit:].cpu(),
+            "contact_gt": batch["contact_gt"][0, emit:].cpu(),
+            "contact_pred": (torch.sigmoid(out["contact_logits"]) > 0.5)[0, emit:].detach().cpu()
+                             if config_value != CONFIG_V else None,
+            "pressure_gt": batch["T_raw"][0, emit:].cpu(),
+        })
+        frame_ids.extend(range(start + emit, start + batch["pose_gt"].shape[1]))
+        root6 = pose_w[half, :6].detach()
+        vel3 = v_w[half, :3].detach()
+        ctx = torch.cat([root6, vel3, torch.ones(1, device=device)], dim=0).unsqueeze(0)
+        prev_start = start
+        prev_pose = pose_w
+        prev_v = v_w
+        meta = (batch["floor_y"][0].cpu(), batch["offsets"][0].cpu(),
+                batch["parents"][0].cpu(), batch["betas"][0].cpu())
+    floor_y, offsets, parents, betas = meta
+    seq = {
+        "pred_pose": torch.cat([c["pred_pose"] for c in chunks], dim=0),
+        "pred_trans": torch.cat([c["pred_trans"] for c in chunks], dim=0),
+        "gt_pose": torch.cat([c["gt_pose"] for c in chunks], dim=0),
+        "gt_trans": torch.cat([c["gt_trans"] for c in chunks], dim=0),
+        "kp_gt": torch.cat([c["kp_gt"] for c in chunks], dim=0),
+        "contact_gt": torch.cat([c["contact_gt"] for c in chunks], dim=0),
+        "contact_pred": (torch.cat([c["contact_pred"] for c in chunks], dim=0)
+                         if config_value != CONFIG_V else None),
+        "pressure_gt": torch.cat([c["pressure_gt"] for c in chunks], dim=0),
+        "pressure_pred": None,
+        "pos_corr": None,
+        "floor_y": floor_y, "offsets": offsets, "parents": parents, "betas": betas,
+    }
+    return seq, frame_ids
+
+
+def _merge_sess_detail(seq, tw, forward_axis, config_value, accum, contact,
+                       session_rows, window_rows, *, session_id, frame_ids,
+                       window_starts):
+    """dump_detail 逐会话记账（正常路径与续写路径共用）。"""
+    sess_accum = _Accum()
+    sess_contact = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    _session_metrics(seq, tw, forward_axis, config_value, sess_accum, sess_contact)
+    for name, value in sess_accum.sums.items():
+        accum.sums[name] = accum.sums.get(name, 0.0) + value
+        accum.counts[name] = accum.counts.get(name, 0.0) + sess_accum.counts[name]
+    for key in contact:
+        contact[key] += sess_contact[key]
+    sess_metrics = sess_accum.means()
+    p_c = sess_contact["tp"] / max(sess_contact["tp"] + sess_contact["fp"], 1)
+    r_c = sess_contact["tp"] / max(sess_contact["tp"] + sess_contact["fn"], 1)
+    sess_metrics["contact_f1"] = 2.0 * p_c * r_c / max(p_c + r_c, 1e-8)
+    sess_metrics["contact_acc"] = (sess_contact["tp"] + sess_contact["tn"]) / max(
+        sess_contact["tp"] + sess_contact["fp"] + sess_contact["fn"] + sess_contact["tn"], 1)
+    sess_metrics["contact_recall"] = sess_contact["tp"] / max(sess_contact["tp"] + sess_contact["fn"], 1)
+    sess_metrics["air_recall"] = sess_contact["tn"] / max(sess_contact["tn"] + sess_contact["fp"], 1)
+    sess_metrics["contact_balanced_acc"] = 0.5 * (
+        sess_metrics["contact_recall"] + sess_metrics["air_recall"])
+    session_rows.append({
+        "frame_ids": list(frame_ids),
+        "session_id": str(session_id),
+        "n_frames": int(seq["pred_pose"].shape[0]),
+        "metrics": sess_metrics,
+    })
+    if window_starts is not None:
+        w_rows = _window_detail_rows(seq, tw, [int(s) for s in window_starts])
+        window_rows["session_ids"].extend([str(session_id)] * len(w_rows["frame_starts"]))
+        window_rows["frame_starts"].extend(w_rows["frame_starts"])
+        window_rows["n_frames"].extend(w_rows["n_frames"])
+        for key, values in w_rows["metrics"].items():
+            window_rows["metrics"].setdefault(key, []).extend(values)
+
+
 def run_protocol(
     checkpoint: dict,
     config: dict,
@@ -1004,7 +1118,10 @@ def run_protocol(
     (window_detail_<split>.json / session_detail_<split>.json, snake_case keys);
     the pooled files are bit-identical either way.
     """
-    if dataset.stride != dataset.window_length:
+    if (dataset.stride != dataset.window_length
+            and not getattr(model, "prev_ctx", False)):
+        # 续写协议（2026-11-01）：V7_Cv5Ctx 的重叠窗评估走 _evaluate_config
+        # 的链式分支，不属于 E6.4 扩散续写短路范围。
         print("protocol skipped: dataset stride %d != window %d (E6.4 continuation eval)"
               % (dataset.stride, dataset.window_length))
         return {}

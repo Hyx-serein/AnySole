@@ -125,7 +125,15 @@ MODEL_REGISTRY: dict[str, ModelEntry] = {
     "V7_Cv5T": ModelEntry("V7_Cv5T", "v7_c2t", "V7_Cv5T: Cv5 双门逐帧化（T 时间门，2026-10-30）"),
     "V7_Cv5LR": ModelEntry("V7_Cv5LR", "v7_c2lr", "V7_Cv5LR: Cv5 双门 + 左右部位门（LR，2026-10-30）"),
     "V7_Cv5TLR": ModelEntry("V7_Cv5TLR", "v7_c2tlr", "V7_Cv5TLR: 逐帧 + 左右部位组合门（TLR，2026-10-30）"),
+    "V7_Cv5Ctx": ModelEntry("V7_Cv5Ctx", "v7_c2ctx", "V7_Cv5Ctx: Cv5 + 上一窗姿态上下文续写（2026-11-01）"),
+    "V7_Cv5Ctx2": ModelEntry("V7_Cv5Ctx2", "v7_c2ctx2", "V7_Cv5Ctx2: Cv5 + 续写 v2（ctx 直连根朝向：部位 query 注入 + 输出残差，2026-11-01）"),
+    "V7_Cv5CtxSS": ModelEntry("V7_Cv5CtxSS", "v7_c2ctx", "V7_Cv5CtxSS: Ctx + scheduled sampling（G1，2026-11-01）"),
+    "V7_Cv5CtxVC": ModelEntry("V7_Cv5CtxVC", "v7_c2ctx_vc", "V7_Cv5CtxVC: Ctx + V 在场条件门控（G2，2026-11-01）"),
+    "V7_Cv5CtxHP": ModelEntry("V7_Cv5CtxHP", "v7_c2ctx_hp", "V7_Cv5CtxHP: Ctx + 评估硬前缀（G3，2026-11-01）"),
+    "V7_Cv5CtxFull": ModelEntry("V7_Cv5CtxFull", "v7_c2ctx_full", "V7_Cv5CtxFull: G1+G2+G3 三合一（G4，2026-11-01）"),
     "V7_Cv5Q": ModelEntry("V7_Cv5Q", "v7_c2q", "V7_Cv5Q: TLR + 第一层解码上下文条件门（Q，2026-10-31）"),
+    "V7_Cv5S": ModelEntry("V7_Cv5S", "v7_c2tlr", "V7_Cv5S: TLR + 显式收益监督（S，λ_s=1.0，2026-11-01）"),
+    "V7_Cv5S01": ModelEntry("V7_Cv5S01", "v7_c2tlr", "V7_Cv5S01: TLR + 显式收益监督（S，λ_s=0.1，2026-11-01）"),
     "V7_Cv7_precheck": ModelEntry("V7_Cv7_precheck", "v7_a", "V7_Cv7 六轮预检"),
     # 阶段 3 触觉泛化（2026-10-31，E6 门控重设计）：以 Cv7（v7_a 无门
     # 入口）为基座，训练侧数据增强单点实验。结构不变，只有训练配方

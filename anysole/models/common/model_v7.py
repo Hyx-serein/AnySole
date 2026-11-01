@@ -127,11 +127,13 @@ class V7MotionHead(nn.Module):
     set_stats 接口与既有 pose head 同款（train.py 统一拟合姿态统计）。"""
 
     def __init__(self, embeddings, dim=D_MODEL, tw=TW, nhead=8,
-                 dim_feedforward=1024, dropout=0.1, n_layers=6, route=False):
+                 dim_feedforward=1024, dropout=0.1, n_layers=6, route=False,
+                 ctx_v2=False):
         super().__init__()
         self.embeddings = embeddings
         self.dim = dim
         self.tw = tw
+        self.ctx_v2 = bool(ctx_v2)
         self.n_parts = len(PART_JOINTS)
         self.part_joints = tuple(tuple(int(j) for j in g) for g in PART_JOINTS)
         self.register_buffer("part_place_idx",
@@ -157,7 +159,7 @@ class V7MotionHead(nn.Module):
 
     def forward(self, m_v, m_t, v_present, t_present, gate=None,
                 t_only_mask=None, t_only_adapters=None, z_override=None,
-                gate_fn=None):
+                gate_fn=None, ctx_vec=None, ctx_pose=None, ctx_block=None):
         """→ (pose (B,tw,POSE_DIM), v_hat (B,tw,3), z_root, z_parts)
 
         ``z_override``（TTA 注入点，2026-10-27）：给定 (B, tw*(1+n_parts), d)
@@ -170,6 +172,30 @@ class V7MotionHead(nn.Module):
             + self.embeddings.time_pe.to(self.root_query.dtype).view(1, self.tw, 1, self.dim)
         q_parts = self.part_queries.expand(B, -1, -1, -1) \
             + self.embeddings.time_pe.to(self.part_queries.dtype).view(1, self.tw, 1, self.dim)
+        if ctx_block is not None:
+            # v3 硬填式（Level 3）：ctx = 重叠区 nf 帧 × [根 6D + 根速度 3
+            # + flag]（评估链 = 上一窗后 nf 帧预测，训练 = GT 前 nf 帧）——
+            # 替换式注入前 nf 帧的根速度 query 与根朝向 query 槽位（含时间
+            # PE），重叠区与上一窗构造性一致（Step2Motion inpainting 的
+            # 回归等价物）。V 在场或 flag=0 的样本不替换（保留学习 query，
+            # V/VT 行回归 Cv5 行为）。
+            nf = ctx_block.shape[1]
+            has = ctx_block[..., -1].mean(dim=1) > 0.5        # (B,)
+            allow = has & (v_present < 0.5)
+            if allow.any():
+                emb = self.ctx_emb(ctx_block)                 # (B, nf, d)
+                tpe = self.embeddings.time_pe[:nf]
+                q_root[allow, :nf, 0, :] = emb[allow] + tpe.to(emb.dtype)
+                q_parts[allow, :nf, 0, :] = emb[allow] + tpe.to(emb.dtype)
+        if ctx_vec is not None:
+            # 续写上下文加性注入（(B,d) → 广播到全部帧）：v1 = 根速度
+            # query；v2（Level 1）= 根部位（朝向）query 槽位同步注入，
+            # 朝向不再只经自注意力间接读取。
+            ctx_bias = ctx_vec.to(q_root.dtype).view(B, 1, 1, self.dim)
+            q_root = q_root + ctx_bias
+            if self.ctx_v2:
+                q_parts[:, :, 0:1, :] = (q_parts[:, :, 0:1, :]
+                                         + ctx_bias.to(q_parts.dtype))
         q = torch.cat([q_root, q_parts], dim=2)          # (B, tw, 1+9, d)
         q = q.reshape(B, self.tw * (1 + self.n_parts), self.dim)
         for layer in self.layers:
@@ -192,6 +218,11 @@ class V7MotionHead(nn.Module):
             [self.out_parts[p](z_parts[..., p, :]) for p in range(self.n_parts)],
             dim=-1)
         pose = pose_parts[..., self.part_place_idx] * self.pose_std + self.pose_mean
+        if ctx_pose is not None:
+            # v2（Level 2）：根朝向输出加 ctx 残差（10→6 MLP，零初始化，
+            # init 贡献严格为零——保留 init 逐位 = Cv5 契约）。根 6D 位于
+            # POSE_DIM 前 6 位（关节 0 = root，part_place_idx 正典序）。
+            pose[..., :6] = pose[..., :6] + ctx_pose.to(pose.dtype).view(B, 1, 6)
         return pose, v_hat, z_root, z_parts
 
 
@@ -213,7 +244,9 @@ class AnySoleModelV7(nn.Module):
                  contact_root: bool = False, reliability_route: bool = False,
                  task_routes: bool = False, t_only_adapters: bool = False,
                  route_temporal: bool = False, part_routes: bool = False,
-                 route_conditional: bool = False):
+                 route_conditional: bool = False, prev_ctx: bool = False,
+                 ctx_v2: bool = False, ctx_vcond: bool = False,
+                 ctx3: bool = False):
         super().__init__()
         self.d = d
         self.tw = tw
@@ -230,6 +263,10 @@ class AnySoleModelV7(nn.Module):
         self.route_temporal = bool(route_temporal)
         self.part_routes = bool(part_routes)
         self.route_conditional = bool(route_conditional)
+        self.prev_ctx = bool(prev_ctx)
+        self.ctx_v2 = bool(ctx_v2)
+        self.ctx_vcond = bool(ctx_vcond)
+        self.ctx3 = bool(ctx3)
         if self.task_routes and not self.reliability_route:
             raise ValueError("Task routes require tactile reliability routing")
         if self.route_temporal and not self.reliability_route:
@@ -241,6 +278,10 @@ class AnySoleModelV7(nn.Module):
                                            and self.route_temporal
                                            and self.part_routes):
             raise ValueError("Conditional routing (Q) requires TLR's full gate structure")
+        if self.ctx_v2 and not self.prev_ctx:
+            raise ValueError("ctx_v2 requires prev_ctx")
+        if self.ctx3 and not self.prev_ctx:
+            raise ValueError("ctx3 requires prev_ctx")
         self.embeddings = SharedEmbeddings(dim=d, tw=tw)
         self.encoders = ModalEncoders(
             self.embeddings, dim=d, tw=tw, tactile_input="raw108",
@@ -251,7 +292,7 @@ class AnySoleModelV7(nn.Module):
         # 运动解码（挂名为 pose_head：train.py 的姿态统计拟合按名调用）。
         self.pose_head = V7MotionHead(
             self.embeddings, dim=d, tw=tw, nhead=nhead, dropout=dropout,
-            n_layers=pose_layers, route=reliability_route)
+            n_layers=pose_layers, route=reliability_route, ctx_v2=bool(ctx_v2))
         self.contact_head = V41ContactHead(dim=d)
         if reliability_route:
             # C：T 信任门（端到端学习，v1 无显式质量标签——设计思路 §3
@@ -259,6 +300,21 @@ class AnySoleModelV7(nn.Module):
             # 由 route_temporal 决定）。task_routes 下本 MLP = 姿态门。
             self.route_mlp = nn.Sequential(
                 nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 1))
+        if self.prev_ctx:
+            # 续写上下文（2026-11-01，V7_续写协议方案 §1-§2）：窗首帧根状态
+            # [根朝向 6D + 根速度 3 + 有效标志 1]（评估链 = 上一窗预测在其
+            # 内部帧 half 处）→ 加性注入根速度 query（q_root += ctx_vec；
+            # 根朝向 query 经解码器自注意力读取）。零初始化保证 init 时
+            # prev_ctx 贡献为零、逐位复现 Cv5。
+            self.ctx_emb = nn.Sequential(
+                nn.Linear(10, d), nn.GELU(), nn.Linear(d, d))
+            nn.init.zeros_(self.ctx_emb[-1].weight)
+            nn.init.zeros_(self.ctx_emb[-1].bias)
+            if self.ctx_v2:
+                self.ctx_pose_emb = nn.Sequential(
+                    nn.Linear(10, 64), nn.GELU(), nn.Linear(64, 6))
+                nn.init.zeros_(self.ctx_pose_emb[-1].weight)
+                nn.init.zeros_(self.ctx_pose_emb[-1].bias)
         # Add private parameters after shared initialization. V2 initially
         # reproduces C's single gate, then learns independent root routing.
         if self.task_routes:
@@ -348,7 +404,7 @@ class AnySoleModelV7(nn.Module):
     def forward(self, V_feat, T_raw, T_phys, config_id=None, subject_ids=None,
                 T_s2m=None, V_hmr=None, mask_v=None, mask_t=None,
                 v_present=None, t_present=None, z_override=None,
-                gate_override=None):
+                gate_override=None, prev_ctx=None):
         """三条件 = 同一前向的三种输入组合。存在掩码默认由 config_id 决定
         （与输入置零同一决定，设计思路 §4）；v_present/t_present 允许调用
         侧覆盖（诊断/干预用）；gate_override（§7 干预诊断钩子）非 None 时
@@ -365,6 +421,23 @@ class AnySoleModelV7(nn.Module):
                                      mask_v=mask_v, mask_t=mask_t)
         m_v = self.v_temporal(v_tok)
         m_t = self.t_temporal(t_tok)
+        ctx_vec = None
+        ctx_pose = None
+        ctx_block = None
+        if self.prev_ctx and prev_ctx is not None:
+            if self.ctx3:
+                # 硬填式：prev_ctx = (B, nf, 10) 块，直接透传（槽位替换在
+                # pose_head 内做，含 V 在场门控）。
+                ctx_block = prev_ctx.to(m_v.dtype)
+            elif self.ctx_vcond and config_id is not None:
+                # G2（续写 v2 实验矩阵）：V 在场（VT/V 条件）ctx 强制置零
+                # ——训练与评估一致（config_id 两侧都已知），打破「ctx
+                # 压过自身证据」的 oracle 契约在 V 行的表现。
+                keep = (config_id == CONFIG_T).to(prev_ctx.dtype).view(-1, 1)
+                prev_ctx = prev_ctx * keep
+            ctx_vec = self.ctx_emb(prev_ctx.to(m_v.dtype))  # (B, d)
+            if self.ctx_v2:
+                ctx_pose = self.ctx_pose_emb(prev_ctx.to(m_v.dtype))  # (B, 6)
         if gate_override is not None:
             gate = gate_override   # 干预/诊断钩子（§7 单组关门；推理不读 GT）
         elif self.route_conditional:
@@ -385,7 +458,8 @@ class AnySoleModelV7(nn.Module):
         pose, v_hat, z_root, z_parts = self.pose_head(
             m_v, m_t, v_present, t_present, gate=gate, gate_fn=gate_fn,
             t_only_mask=t_only, t_only_adapters=adapters,
-            z_override=z_override)
+            z_override=z_override, ctx_vec=ctx_vec, ctx_pose=ctx_pose,
+            ctx_block=ctx_block)
         if self.route_conditional and gate_override is None:
             gate = captured.get("gate")  # 监控/损失输出用（Q 的门在解码器内计算）
         trans_hat = torch.cumsum(v_hat, dim=1) / float(FPS)
